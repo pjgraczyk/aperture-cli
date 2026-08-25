@@ -1,8 +1,6 @@
-// Package codex is the OpenAI Codex client. It speaks OpenAI's /v1/responses
-// API and is registered only with providers whose compatibility map includes
-// "openai_responses". On launch it writes a CODEX_HOME containing auth.json
-// (pre-populated so the first run skips interactive login) and config.toml
-// (pointing Codex at the aperture gateway).
+// Package codex is the OpenAI Codex client. It supports both OpenAI platform
+// API-key providers through /v1/responses and ChatGPT subscription providers
+// through Aperture's /codex/responses OAuth passthrough route.
 package codex
 
 import (
@@ -131,14 +129,15 @@ func (c *Client) launch(g *config.Global, p config.ProviderInfo, model string) m
 	if bin == "" {
 		bin = binaryName
 	}
-	codexHome, err := writeConfig(g.ApertureHost)
+	subscription := isChatGPTSubscription(p)
+	codexHome, err := writeConfig(g.ApertureHost, subscription)
 	if err != nil {
 		return errorResult("Failed to write Codex config: " + err.Error())
 	}
-	env := map[string]string{
-		"OPENAI_BASE_URL": g.ApertureHost + "/v1",
-		"OPENAI_API_KEY":  "not-needed",
-		"CODEX_HOME":      codexHome,
+	env := map[string]string{"CODEX_HOME": codexHome}
+	if !subscription {
+		env["OPENAI_BASE_URL"] = strings.TrimRight(g.ApertureHost, "/") + "/v1"
+		env["OPENAI_API_KEY"] = "not-needed"
 	}
 	if model != "" {
 		env["OPENAI_MODEL"] = stripProviderPrefix(model)
@@ -227,6 +226,19 @@ func stripProviderPrefix(fqn string) string {
 		return after
 	}
 	return fqn
+}
+
+// isChatGPTSubscription identifies providers that require Codex to supply its
+// ChatGPT OAuth token. New gateways expose requires_client_auth; the name/ID
+// checks retain compatibility with older gateways.
+func isChatGPTSubscription(p config.ProviderInfo) bool {
+	if p.RequiresClientAuth {
+		return true
+	}
+	id := strings.ToLower(p.ID)
+	name := strings.ToLower(p.Name)
+	return id == "openai-sub" || id == "codex-oauth" ||
+		strings.Contains(name, "chatgpt subscription") || strings.Contains(name, "codex (oauth)")
 }
 
 // errorResult returns a Result that pops the current stack and emits an

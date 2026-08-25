@@ -51,7 +51,7 @@ func TestWriteConfig(t *testing.T) {
 	t.Setenv("HOME", tmp)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, ".config"))
 
-	codexHome, err := writeConfig(testHost)
+	codexHome, err := writeConfig(testHost, false)
 	if err != nil {
 		t.Fatalf("writeConfig: %v", err)
 	}
@@ -78,9 +78,99 @@ func TestWriteConfig(t *testing.T) {
 	if got := string(tomlData); !containsAll(got, []string{
 		"model_provider = \"aperture\"",
 		"base_url = \"" + testHost + "/v1\"",
+		"wire_api = \"responses\"",
 		"env_key = \"OPENAI_API_KEY\"",
 	}) {
 		t.Errorf("config.toml missing expected entries:\n%s", got)
+	}
+}
+
+func TestWriteConfigSubscription(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, ".config"))
+
+	codexHome, err := writeConfig(testHost, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexHome, err = writeConfig(testHost, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(codexHome, "auth.json")); !os.IsNotExist(err) {
+		t.Fatalf("legacy placeholder auth.json was not removed: %v", err)
+	}
+	tomlData, err := os.ReadFile(filepath.Join(codexHome, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(tomlData)
+	if !containsAll(got, []string{
+		"base_url = \"" + testHost + "/codex\"",
+		"wire_api = \"responses\"",
+		"requires_openai_auth = true",
+	}) || contains(got, "env_key") {
+		t.Errorf("unexpected subscription config:\n%s", got)
+	}
+
+	oauth := []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"keep-me"}}`)
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), oauth, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeConfig(testHost, true); err != nil {
+		t.Fatal(err)
+	}
+	preserved, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	if err != nil || string(preserved) != string(oauth) {
+		t.Fatalf("OAuth auth.json was not preserved: %q, %v", preserved, err)
+	}
+}
+
+func TestWriteConfigPreservesOAuthWhenSwitchingToAPIKeyProvider(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, ".config"))
+
+	codexHome, err := writeConfig(testHost, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oauth := []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"keep-me"}}`)
+	authPath := filepath.Join(codexHome, "auth.json")
+	if err := os.WriteFile(authPath, oauth, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeConfig(testHost+"/", false); err != nil {
+		t.Fatal(err)
+	}
+	preserved, err := os.ReadFile(authPath)
+	if err != nil || string(preserved) != string(oauth) {
+		t.Fatalf("OAuth auth.json was not preserved: %q, %v", preserved, err)
+	}
+	tomlData, err := os.ReadFile(filepath.Join(codexHome, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(string(tomlData), testHost+"//v1") {
+		t.Fatalf("base URL contains a double slash:\n%s", tomlData)
+	}
+}
+
+func TestIsChatGPTSubscription(t *testing.T) {
+	tests := []struct {
+		provider config.ProviderInfo
+		want     bool
+	}{
+		{config.ProviderInfo{ID: "openai-sub"}, true},
+		{config.ProviderInfo{ID: "codex-oauth"}, true},
+		{config.ProviderInfo{ID: "custom-subscription", RequiresClientAuth: true}, true},
+		{config.ProviderInfo{ID: "openai"}, false},
+	}
+	for _, tt := range tests {
+		if got := isChatGPTSubscription(tt.provider); got != tt.want {
+			t.Errorf("isChatGPTSubscription(%+v) = %v, want %v", tt.provider, got, tt.want)
+		}
 	}
 }
 
