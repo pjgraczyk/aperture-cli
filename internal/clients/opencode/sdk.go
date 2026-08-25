@@ -4,13 +4,17 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/tailscale/aperture-cli/internal/config"
 )
 
 type opencodeConfig struct {
-	Schema   string                      `json:"$schema,omitempty"`
-	Provider map[string]opencodeProvider `json:"provider,omitempty"`
+	Schema     string                      `json:"$schema,omitempty"`
+	Provider   map[string]opencodeProvider `json:"provider,omitempty"`
+	Permission map[string]string           `json:"permission,omitempty"`
 }
 
 type opencodeProvider struct {
@@ -72,25 +76,28 @@ func pickSDK(compat map[string]bool, apertureHost string) (npm string, options m
 	return "", nil
 }
 
-// writeProviderConfig writes the per-launch OpenCode config under
-// ~/.opencode/tmp_aperture_config.json and returns the path plus a cleanup
+// writeProviderConfig writes a unique per-launch OpenCode config and returns
+// the path plus an idempotent cleanup
 // function that removes the file. The config defines one provider (the
 // chosen one) mapped to the SDK picked from its compatibility map.
-func writeProviderConfig(apertureHost string, p config.ProviderInfo) (string, func(), error) {
+func writeProviderConfig(apertureHost string, p config.ProviderInfo, yolo bool) (string, func() error, error) {
 	npm, options := pickSDK(p.Compatibility, apertureHost)
+	providerID := providerConfigID(p)
 
 	models := make(map[string]opencodeModelEntry, len(p.Models))
 	whitelist := make([]string, 0, len(p.Models))
 	for _, m := range p.Models {
-		fqn := p.ID + "/" + m
-		models[fqn] = opencodeModelEntry{ID: m, Name: fqn}
-		whitelist = append(whitelist, fqn)
+		fqn := providerID + "/" + m
+		// Model keys and whitelist entries are relative to the provider.
+		// OpenCode qualifies them as "provider/model" at the CLI boundary.
+		models[m] = opencodeModelEntry{ID: m, Name: fqn}
+		whitelist = append(whitelist, m)
 	}
 
 	cfg := opencodeConfig{
 		Schema: "https://opencode.ai/config.json",
 		Provider: map[string]opencodeProvider{
-			p.ID: {
+			providerID: {
 				NPM:       npm,
 				Name:      "Aperture (" + p.ID + ")",
 				Options:   options,
@@ -98,6 +105,9 @@ func writeProviderConfig(apertureHost string, p config.ProviderInfo) (string, fu
 				Whitelist: whitelist,
 			},
 		},
+	}
+	if yolo {
+		cfg.Permission = map[string]string{"*": "allow"}
 	}
 
 	data, err := json.Marshal(cfg)
@@ -113,9 +123,53 @@ func writeProviderConfig(apertureHost string, p config.ProviderInfo) (string, fu
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		return "", nil, err
 	}
-	path := filepath.Join(configDir, "tmp_aperture_config.json")
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := cleanupStaleConfigs(configDir, time.Now()); err != nil {
 		return "", nil, err
 	}
-	return path, func() { os.Remove(path) }, nil
+	file, err := os.CreateTemp(configDir, "aperture-*.json")
+	if err != nil {
+		return "", nil, err
+	}
+	path := file.Name()
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		os.Remove(path)
+		return "", nil, err
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(path)
+		return "", nil, err
+	}
+	var once sync.Once
+	var cleanupErr error
+	return path, func() error {
+		once.Do(func() { cleanupErr = os.Remove(path) })
+		return cleanupErr
+	}, nil
+}
+
+func cleanupStaleConfigs(dir string, now time.Time) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		owned := name == "tmp_aperture_config.json" ||
+			(strings.HasPrefix(name, "aperture-") && strings.HasSuffix(name, ".json"))
+		if !owned || entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if now.Sub(info.ModTime()) < 24*time.Hour {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }

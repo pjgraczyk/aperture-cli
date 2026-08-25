@@ -1,6 +1,7 @@
 package clients
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,7 +22,7 @@ type LaunchSpec struct {
 	Env map[string]string
 	// Cleanup runs after the child exits, before the done-msg is emitted.
 	// Use it to remove temporary config files.
-	Cleanup func()
+	Cleanup func() error
 	// Debug, when true, dumps the resolved Env and Args to stderr before
 	// exec (matches the `-debug` flag wiring).
 	Debug bool
@@ -59,7 +60,7 @@ func Launch(spec LaunchSpec) tea.Cmd {
 
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
 		if spec.Cleanup != nil {
-			spec.Cleanup()
+			err = errors.Join(err, spec.Cleanup())
 		}
 		return menu.ExecDoneMsg{Err: err}
 	})

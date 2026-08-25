@@ -19,3 +19,10 @@ type LaunchDoneMsg struct{ Err error }
 // uses to pop the stack one level. Suitable for uninstall-style actions
 // that complete synchronously without touching the agent binary layout.
 type SimpleDoneMsg struct{ Err error }
+
+// ContinueMsg lets an asynchronous command feed a new menu result back into
+// the menu engine. It is used for multi-step setup and launch preflights.
+type ContinueMsg struct {
+	Result Result
+	Err    error
+}

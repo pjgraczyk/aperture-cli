@@ -8,15 +8,12 @@ package tui
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/tailscale/aperture-cli/internal/apertureapi"
 	"github.com/tailscale/aperture-cli/internal/bridges"
 	"github.com/tailscale/aperture-cli/internal/clients"
 	"github.com/tailscale/aperture-cli/internal/config"
@@ -121,25 +118,7 @@ func runPreflight(host string) tea.Cmd {
 }
 
 func fetchProviders(host string) ([]config.ProviderInfo, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	url := strings.TrimRight(host, "/") + "/api/providers"
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("unexpected status %d from %s", resp.StatusCode, url)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	var provs []config.ProviderInfo
-	if err := json.Unmarshal(body, &provs); err != nil {
-		return nil, fmt.Errorf("could not parse providers response: %w", err)
-	}
-	return provs, nil
+	return apertureapi.NewClient().Providers(context.Background(), host)
 }
 
 func (m *model) activateEndpointCmd(ep config.Endpoint) tea.Cmd {
@@ -295,6 +274,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case menu.ExecDoneMsg:
+		if msg.Err != nil {
+			m.errMsg = msg.Err.Error()
+			m.step = stepError
+			return m, nil
+		}
 		// A client's foreground launch has exited. Re-run preflight: the
 		// user may have changed things outside the launcher while the
 		// agent was running.
@@ -302,6 +286,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.step = stepPreflight
 		m.preflightLabel = "Checking " + m.g.ApertureHost + " ..."
 		return m, runPreflight(m.g.ApertureHost)
+
+	case menu.ContinueMsg:
+		if msg.Err != nil {
+			m.errMsg = msg.Err.Error()
+			m.step = stepError
+			return m, nil
+		}
+		return m.applyResult(msg.Result)
 
 	case menu.InstallDoneMsg:
 		// Rebuild the root menu so install state is reflected.

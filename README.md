@@ -67,6 +67,31 @@ To use bridge mode:
 | `-version` | Print build version and exit |
 | `-debug` | Print environment variables set before launching the agent |
 
+### Inspecting Aperture
+
+List the models available from the active Aperture endpoint, including their
+context windows, supported APIs, and pricing:
+
+```sh
+aperture models
+aperture models --json
+aperture models --endpoint https://ai.example.com
+```
+
+Check endpoint connectivity and validate that the provider and model catalogs
+agree:
+
+```sh
+aperture doctor
+aperture doctor --all
+aperture doctor --json
+```
+
+Both commands use the active configured endpoint by default and support
+endpoints reached through an Aperture bridge. An explicit `--endpoint` is
+treated as a direct URL. Bridge connection progress is written to stderr so
+JSON output on stdout remains machine-readable.
+
 ## Development
 
 ```sh
