@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tailscale/aperture-cli/internal/config"
@@ -21,6 +22,8 @@ func TestLaunchState_RoundTrip(t *testing.T) {
 		LastBackendType: "bedrock",
 		LastProviderID:  "anthropic-via-aperture",
 		LastModel:       "anthropic-via-aperture/claude-sonnet",
+		LastEndpointURL: "http://aperture.example.com",
+		LastBridgeID:    "bridge-abcdef",
 	}
 	if err := config.SaveState(want); err != nil {
 		t.Fatalf("SaveState: %v", err)
@@ -73,6 +76,22 @@ func TestLaunchState_LegacyMigration(t *testing.T) {
 	}
 }
 
+func TestGlobal_RecordLaunchBindsActiveEndpoint(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, ".config"))
+
+	g := &config.Global{Settings: config.Settings{Endpoints: []config.Endpoint{
+		{URL: "http://aperture.example.com", BridgeID: "bridge-abcdef"},
+	}}}
+	if err := g.RecordLaunch(config.LaunchState{LastClientName: "Claude Code"}); err != nil {
+		t.Fatal(err)
+	}
+	if g.LastLaunch.LastEndpointURL != "http://aperture.example.com" || g.LastLaunch.LastBridgeID != "bridge-abcdef" {
+		t.Fatalf("recorded launch endpoint = %q via %q", g.LastLaunch.LastEndpointURL, g.LastLaunch.LastBridgeID)
+	}
+}
+
 func TestSettings_RoundTrip(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
@@ -107,6 +126,47 @@ func TestSettings_RoundTrip(t *testing.T) {
 	}
 	if !got.YoloMode {
 		t.Error("YoloMode = false, want true")
+	}
+}
+
+func TestSettings_MissingFileUsesDefaults(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, ".config"))
+
+	got, err := config.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Endpoints) != 1 || got.Endpoints[0].URL != config.DefaultLocation {
+		t.Errorf("default endpoints = %+v", got.Endpoints)
+	}
+}
+
+func TestSettings_InvalidJSONReturnsErrorWithoutReplacingFile(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	cfgDir := filepath.Join(tmp, ".config")
+	t.Setenv("XDG_CONFIG_HOME", cfgDir)
+	path := filepath.Join(cfgDir, "aperture", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const malformed = `{"bridges":[{"id":"bridge-abcdef"}]`
+	if err := os.WriteFile(path, []byte(malformed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := config.LoadSettings()
+	if err == nil || !strings.Contains(err.Error(), "parsing settings") {
+		t.Fatalf("LoadSettings error = %v, want parsing error", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != malformed {
+		t.Errorf("malformed settings were replaced: got %q", got)
 	}
 }
 
@@ -159,6 +219,42 @@ func TestGlobal_SetActiveEndpoint_DistinguishesBridge(t *testing.T) {
 	}
 	if len(g.Settings.Endpoints) != 2 {
 		t.Errorf("endpoints len = %d, want 2", len(g.Settings.Endpoints))
+	}
+}
+
+func TestGlobal_RemoveInactiveEndpointPreservesRuntimeHost(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, ".config"))
+
+	g := &config.Global{
+		ApertureHost: "http://127.0.0.1:12345",
+		Settings: config.Settings{Endpoints: []config.Endpoint{
+			{URL: "http://active", BridgeID: "bridge-abcdef"},
+			{URL: "http://candidate", BridgeID: "bridge-fedcba"},
+		}},
+	}
+	if err := g.RemoveEndpoint(1); err != nil {
+		t.Fatal(err)
+	}
+	if g.ApertureHost != "http://127.0.0.1:12345" {
+		t.Fatalf("removing inactive endpoint changed runtime host to %q", g.ApertureHost)
+	}
+}
+
+func TestGlobal_ReplaceEndpointDeduplicates(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, ".config"))
+
+	active := config.Endpoint{URL: "http://active"}
+	candidate := config.Endpoint{URL: "http://candidate"}
+	g := &config.Global{Settings: config.Settings{Endpoints: []config.Endpoint{active, candidate}}}
+	if err := g.ReplaceEndpoint(candidate, active); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Settings.Endpoints) != 1 || g.Settings.Endpoints[0] != active {
+		t.Fatalf("endpoints = %+v, want one active endpoint", g.Settings.Endpoints)
 	}
 }
 

@@ -1,11 +1,18 @@
 package tui
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/tailscale/aperture-cli/internal/clients"
 	"github.com/tailscale/aperture-cli/internal/config"
 	"github.com/tailscale/aperture-cli/internal/menu"
@@ -80,7 +87,11 @@ func TestRootMenu_QuickSelectPrepended(t *testing.T) {
 	withFakeClients(t, []clients.Client{fc})
 
 	m := &model{g: &config.Global{
-		LastLaunch: config.LaunchState{LastClientName: "A"},
+		Settings: config.Settings{Endpoints: []config.Endpoint{{URL: "http://ai"}}},
+		LastLaunch: config.LaunchState{
+			LastClientName:  "A",
+			LastEndpointURL: "http://ai",
+		},
 	}}
 	root := m.rootMenu()
 
@@ -115,13 +126,82 @@ func TestRootMenu_NoQuickSelectWhenReplayNil(t *testing.T) {
 	withFakeClients(t, []clients.Client{fc})
 
 	m := &model{g: &config.Global{
-		LastLaunch: config.LaunchState{LastClientName: "A"},
+		Settings: config.Settings{Endpoints: []config.Endpoint{{URL: "http://ai"}}},
+		LastLaunch: config.LaunchState{
+			LastClientName:  "A",
+			LastEndpointURL: "http://ai",
+		},
 	}}
 	root := m.rootMenu()
 	for _, it := range root.Items {
 		if !it.Hidden && strings.Contains(it.Label, "Quick select") {
 			t.Errorf("unexpected quick-select row: %+v", it)
 		}
+	}
+}
+
+func TestRootMenu_NoQuickSelectWithoutRecordedEndpoint(t *testing.T) {
+	fc := &fakeClient{
+		name:       "A",
+		installed:  true,
+		replayCmd:  func() tea.Msg { return menu.ExecDoneMsg{} },
+		quickLabel: "A via Whatever",
+	}
+	withFakeClients(t, []clients.Client{fc})
+
+	m := &model{g: &config.Global{
+		Settings:   config.Settings{Endpoints: []config.Endpoint{{URL: "http://ai"}}},
+		LastLaunch: config.LaunchState{LastClientName: "A"},
+	}}
+	for _, it := range m.rootMenu().Items {
+		if !it.Hidden && strings.Contains(it.Label, "Quick select") {
+			t.Errorf("unexpected quick-select row without a recorded endpoint: %+v", it)
+		}
+	}
+}
+
+func TestQuickSelectRequiresRecordedEndpointToBeActive(t *testing.T) {
+	replayed := false
+	fc := &fakeClient{
+		name:      "A",
+		installed: true,
+		replayCmd: func() tea.Msg {
+			replayed = true
+			return menu.ExecDoneMsg{}
+		},
+		quickLabel: "A via Whatever",
+	}
+	withFakeClients(t, []clients.Client{fc})
+
+	active := config.Endpoint{URL: "http://ai", BridgeID: "bridge-current"}
+	saved := config.Endpoint{URL: "http://ai", BridgeID: "bridge-saved"}
+	m := &model{
+		g: &config.Global{
+			Settings:  config.Settings{Endpoints: []config.Endpoint{active, saved}},
+			Providers: []config.ProviderInfo{{ID: "old-provider"}},
+			LastLaunch: config.LaunchState{
+				LastClientName:  "A",
+				LastEndpointURL: saved.URL,
+				LastBridgeID:    saved.BridgeID,
+			},
+		},
+	}
+	for _, item := range m.rootMenu().Items {
+		if !item.Hidden && strings.Contains(item.Label, "Quick select") {
+			t.Fatalf("quick-select shown for inactive endpoint: %+v", item)
+		}
+	}
+
+	// Switching back to the recorded URL and bridge makes the saved launch
+	// valid again without rewriting launch state.
+	m.g.Settings.Endpoints = []config.Endpoint{saved, active}
+	quick := m.rootMenu().Items[0]
+	if !strings.Contains(quick.Label, "Quick select") || quick.Action().Cmd == nil {
+		t.Fatalf("quick-select did not reappear for active recorded endpoint: %+v", quick)
+	}
+	quick.Action().Cmd()
+	if !replayed {
+		t.Fatal("quick-select did not replay saved launch")
 	}
 }
 
@@ -364,6 +444,407 @@ func TestEndpointActivationFailure_ShowsSetupGuide(t *testing.T) {
 		}
 		t.Errorf("top menu title = %q, want %q", title, setupGuideTitle)
 	}
+	if got := m.menuHeader(m.top()); !strings.Contains(got, "timeout") {
+		t.Errorf("failure header does not contain the underlying error: %q", got)
+	}
+}
+
+func TestInstallFailureShowsError(t *testing.T) {
+	m := &model{g: &config.Global{}, step: stepMenu}
+	installMenu := &menu.Menu{Title: "Install Claude Code?"}
+	m.resetStack(installMenu)
+
+	m.Update(menu.InstallDoneMsg{Err: fmt.Errorf("exit status 1")})
+	if m.step != stepError {
+		t.Fatalf("step = %v, want stepError", m.step)
+	}
+	if !strings.Contains(m.errMsg, "Install failed: exit status 1") {
+		t.Errorf("errMsg = %q, want install failure", m.errMsg)
+	}
+	if m.top() != installMenu {
+		t.Error("install failure discarded the confirmation menu")
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.step != stepMenu || m.top() != installMenu {
+		t.Error("dismissing the error did not return to the install confirmation")
+	}
+}
+
+func TestInstallCompletionRequiresDetectedBinary(t *testing.T) {
+	client := &fakeClient{name: "Claude Code"}
+	msg := installDoneMsg(client, false, nil)
+	if msg.Err == nil || !strings.Contains(msg.Err.Error(), `"fake" was not found`) {
+		t.Fatalf("installDoneMsg error = %v, want missing binary", msg.Err)
+	}
+
+	client.installed = true
+	if msg := installDoneMsg(client, false, nil); msg.Err != nil {
+		t.Fatalf("installDoneMsg error = %v for installed client", msg.Err)
+	}
+
+	wantErr := fmt.Errorf("installer failed")
+	if msg := installDoneMsg(client, false, wantErr); msg.Err != wantErr {
+		t.Fatalf("installDoneMsg error = %v, want original error %v", msg.Err, wantErr)
+	}
+}
+
+func TestInstallCompletionCanSkipBinaryCheck(t *testing.T) {
+	client := &fakeClient{name: "Claude Cowork"}
+	if msg := installDoneMsg(client, true, nil); msg.Err != nil {
+		t.Fatalf("installDoneMsg error = %v for user-driven install", msg.Err)
+	}
+
+	wantErr := fmt.Errorf("could not open download page")
+	if msg := installDoneMsg(client, true, wantErr); msg.Err != wantErr {
+		t.Fatalf("installDoneMsg error = %v, want original error %v", msg.Err, wantErr)
+	}
+}
+
+func TestSetupGuideMenu_BridgeDoesNotRequireSystemTailscale(t *testing.T) {
+	m := &model{g: &config.Global{
+		ApertureHost: "http://aperture",
+		Settings: config.Settings{
+			Bridges:   []config.Bridge{{ID: "bridge-abcdef", Name: "Work Bridge"}},
+			Endpoints: []config.Endpoint{{URL: "http://aperture", BridgeID: "bridge-abcdef"}},
+		},
+	}}
+
+	guide := m.setupGuideMenu()
+	if !strings.Contains(guide.Preamble, "embedded Tailscale node") {
+		t.Errorf("bridge preamble = %q", guide.Preamble)
+	}
+	if !strings.Contains(guide.Preamble, "does not need Tailscale installed") {
+		t.Errorf("bridge preamble gives system-Tailscale guidance: %q", guide.Preamble)
+	}
+}
+
+func TestEndpointBridgeMenu_AddsFirstBridgeInline(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("XDG_CONFIG_HOME", tmp+"/.config")
+	m := &model{
+		g: &config.Global{Settings: config.Settings{
+			Endpoints: []config.Endpoint{{URL: "http://ai"}},
+		}},
+		step: stepMenu,
+	}
+	m.resetStack(m.endpointBridgeMenu())
+
+	var add menu.MenuItem
+	for _, item := range m.top().Items {
+		if item.Label == "Add Bridge" {
+			add = item
+			break
+		}
+	}
+	if add.Action == nil {
+		t.Fatal("Add Bridge action not found")
+	}
+	add.Action()
+	if m.step != stepInput || m.inputOnSave == nil {
+		t.Fatal("Add Bridge did not prompt for a name")
+	}
+	if cmd := m.inputOnSave("Work Bridge"); cmd != nil {
+		if msg := cmd(); msg != nil {
+			t.Fatalf("adding bridge returned %T: %v", msg, msg)
+		}
+	}
+
+	if len(m.g.Settings.Bridges) != 1 || m.g.Settings.Bridges[0].Name != "Work Bridge" {
+		t.Fatalf("bridges = %+v", m.g.Settings.Bridges)
+	}
+	if top := m.top(); top.Title != "Choose a bridge" || len(top.Items) != 2 || top.Items[0].Label != "Work Bridge" || top.Items[1].Label != "Add Bridge" {
+		t.Fatalf("bridge chooser was not refreshed: %+v", top)
+	}
+	if m.step != stepInput || m.inputTitle != "Add Bridge Endpoint:" {
+		t.Fatalf("adding bridge did not continue to endpoint URL: step=%v title=%q", m.step, m.inputTitle)
+	}
+}
+
+func TestEndpointBridgeMenu_OffersAddBridgeWhenOneExists(t *testing.T) {
+	m := &model{g: &config.Global{Settings: config.Settings{
+		Bridges: []config.Bridge{{ID: "bridge-abcdef", Name: "First"}},
+	}}}
+
+	var labels []string
+	for _, item := range m.endpointBridgeMenu().Items {
+		if !item.Disabled {
+			labels = append(labels, item.Label)
+		}
+	}
+	if got := strings.Join(labels, ","); got != "First,Add Bridge" {
+		t.Fatalf("bridge chooser labels = %q, want First,Add Bridge", got)
+	}
+}
+
+func TestBridgeEndpointFailureKeepsPreviousEndpointActive(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("XDG_CONFIG_HOME", tmp+"/.config")
+	old := config.Endpoint{URL: "http://old"}
+	bridge := config.Bridge{ID: "bridge-abcdef", Name: "Second"}
+	m := &model{
+		g: &config.Global{
+			ApertureHost: "http://old",
+			Settings: config.Settings{
+				Bridges:   []config.Bridge{bridge},
+				Endpoints: []config.Endpoint{old},
+			},
+			Providers: []config.ProviderInfo{{ID: "old-provider"}},
+		},
+		step:      stepMenu,
+		connected: true,
+	}
+	chooser := m.endpointBridgeMenu()
+	chooser.Items[0].Action()
+	want := config.Endpoint{URL: "http://new", BridgeID: bridge.ID}
+	cmd := m.inputOnSave(want.URL)
+	if cmd == nil {
+		t.Fatal("saving bridge endpoint did not begin activation")
+	}
+	if got := m.g.ActiveEndpoint(); !sameEndpoint(got, old) {
+		t.Fatalf("active endpoint changed before activation: %+v", got)
+	}
+	if !m.endpointConfigured(want) {
+		t.Fatalf("candidate endpoint was not saved: %+v", m.g.Settings.Endpoints)
+	}
+
+	msg := cmd()
+	result, ok := msg.(endpointActivationResult)
+	if !ok {
+		t.Fatalf("activation message = %T", msg)
+	}
+	if !sameEndpoint(result.endpoint, want) || result.err == nil {
+		t.Fatalf("activation result = %+v, want failed second bridge endpoint", result)
+	}
+	m.Update(result)
+	if got := m.g.ActiveEndpoint(); !sameEndpoint(got, old) {
+		t.Fatalf("failed activation changed active endpoint: %+v", got)
+	}
+	if m.g.ApertureHost != "http://old" || len(m.g.Providers) != 1 || m.g.Providers[0].ID != "old-provider" {
+		t.Fatalf("failed activation replaced working runtime state: host=%q providers=%+v", m.g.ApertureHost, m.g.Providers)
+	}
+	if !strings.Contains(m.top().Preamble, "previous endpoint remains active") {
+		t.Fatalf("failure menu does not explain retained endpoint: %q", m.top().Preamble)
+	}
+	var actions []string
+	for _, item := range m.top().Items {
+		actions = append(actions, item.Label)
+	}
+	for _, want := range []string{"Retry connection", "Edit endpoint URL", "Connection options", "Return to active endpoint", "Remove endpoint"} {
+		if !slices.Contains(actions, want) {
+			t.Errorf("failure actions = %v, missing %q", actions, want)
+		}
+	}
+}
+
+func TestDirectEndpointIsPromotedOnlyAfterModelsSucceed(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("XDG_CONFIG_HOME", tmp+"/.config")
+	srv := modelsServer(t)
+	old := config.Endpoint{URL: "http://old"}
+	m := &model{
+		g: &config.Global{
+			ApertureHost: "http://old",
+			Settings:     config.Settings{Endpoints: []config.Endpoint{old}},
+			Providers:    []config.ProviderInfo{{ID: "old-provider"}},
+		},
+		step: stepMenu,
+	}
+
+	m.addEndpointConnectionMenu().Items[0].Action()
+	cmd := m.inputOnSave(srv.URL)
+	if got := m.g.ActiveEndpoint(); !sameEndpoint(got, old) {
+		t.Fatalf("active endpoint changed before /v1/models: %+v", got)
+	}
+	activation := cmd()
+	m.Update(activation)
+	if got := m.g.ActiveEndpoint(); got.URL != srv.URL {
+		t.Fatalf("active endpoint = %+v, want %q", got, srv.URL)
+	}
+	if m.g.ApertureHost != srv.URL || len(m.g.Providers) != 1 || m.g.Providers[0].ID != "anthropic" {
+		t.Fatalf("successful activation state: host=%q providers=%+v", m.g.ApertureHost, m.g.Providers)
+	}
+}
+
+func TestBridgeLogSinkIgnoresLateLogsAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan string, 1)
+	logf := bridgeLogSink(ctx, ch)
+
+	cancel()
+	close(ch)
+	// This is the sequence that panicked in v0.0.9: preflight had ended and
+	// closed its channel, but tsnet emitted another background debug log.
+	logf("late tsnet log")
+}
+
+func TestWaitBridgeLogDrainsBufferedLogBeforeCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan string, 1)
+	ch <- "final dial error"
+	cancel()
+
+	msg := waitBridgeLog(ctx, ch)()
+	logMsg, ok := msg.(bridgeLogMsg)
+	if !ok {
+		t.Fatalf("message = %T, want bridgeLogMsg", msg)
+	}
+	if logMsg.line != "final dial error" {
+		t.Errorf("line = %q, want final dial error", logMsg.line)
+	}
+}
+
+func TestAppendBridgeLogRetainsDiagnosticsOverTsnetNoise(t *testing.T) {
+	logs := []string{
+		`Bridge network: state=Running tailnet="example.com" peers=598`,
+		`Bridge target is visible: requested="aperture.example.ts.net"`,
+	}
+	for i := range bridgeLogLimit + 10 {
+		logs = appendBridgeLog(logs, fmt.Sprintf("magicsock: noisy line %d", i))
+	}
+	logs = appendBridgeLog(logs, "Bridge dial failed: lookup failed")
+
+	if len(logs) != bridgeLogLimit {
+		t.Fatalf("len(logs) = %d, want %d", len(logs), bridgeLogLimit)
+	}
+	got := strings.Join(logs, "\n")
+	for _, want := range []string{"Bridge network:", "Bridge target is visible:", "Bridge dial failed:"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("logs lost %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestFetchProvidersIncludesErrorResponseBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "bridge proxy error: lookup aperture", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	_, err := fetchProviders(srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "lookup aperture") {
+		t.Fatalf("fetchProviders error = %v, want response detail", err)
+	}
+}
+
+func TestFetchProvidersUsesModelsEndpoint(t *testing.T) {
+	srv := modelsServerWithHandler(t, func(r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %q, want GET", r.Method)
+		}
+		if r.URL.Path != "/v1/models" {
+			t.Errorf("path = %q, want /v1/models", r.URL.Path)
+		}
+		if got := r.Header.Get("User-Agent"); got != "aperture-cli" {
+			t.Errorf("User-Agent = %q, want aperture-cli", got)
+		}
+	})
+	defer srv.Close()
+
+	got, err := fetchProviders(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "anthropic" || !got[0].SupportsEndpoint(config.EndpointAnthropicMessages) {
+		t.Fatalf("fetchProviders() = %#v, want Anthropic Messages provider", got)
+	}
+}
+
+func TestFetchProvidersContextHonorsCancellation(t *testing.T) {
+	requestStarted := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := fetchProvidersContext(ctx, srv.URL, time.Minute)
+		result <- err
+	}()
+	<-requestStarted
+	cancel()
+
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("fetchProvidersContext error = %v, want context canceled", err)
+	}
+}
+
+func modelsServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return modelsServerWithHandler(t, nil)
+}
+
+func modelsServerWithHandler(t *testing.T, check func(*http.Request)) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if check != nil {
+			check(r)
+		}
+		_, _ = w.Write([]byte(`{
+			"object":"list",
+			"data":[{
+				"id":"claude-opus-5",
+				"supported_endpoints":["/v1/messages"],
+				"metadata":{"provider":{
+					"id":"anthropic","name":"Anthropic","description":"",
+					"requires_client_auth":false,"upstream":"anthropic"
+				}}
+			}]
+		}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestWrapTextPreservesContentWithinTerminalWidth(t *testing.T) {
+	m := &model{width: 40}
+	text := "Bridge dial failed: address=aperture.example.ts.net:80 error=lookup aperture.example.ts.net on 127.0.0.53:53: no such host"
+	got := m.wrapText("  ", text)
+
+	for i, line := range strings.Split(got, "\n") {
+		if width := ansi.StringWidth(line); width > m.width {
+			t.Errorf("line %d width = %d, want <= %d: %q", i, width, m.width, line)
+		}
+		if !strings.HasPrefix(line, "  ") {
+			t.Errorf("line %d does not preserve indentation: %q", i, line)
+		}
+	}
+	compact := func(s string) string { return strings.Join(strings.Fields(ansi.Strip(s)), "") }
+	if compact(got) != compact(text) {
+		t.Errorf("wrapped content changed:\n got: %q\nwant: %q", got, text)
+	}
+}
+
+func TestFailureViewWrapsDiagnostics(t *testing.T) {
+	m := &model{
+		g: &config.Global{
+			ApertureHost: "http://aperture.example.ts.net",
+			Debug:        true,
+			Settings: config.Settings{
+				Bridges:   []config.Bridge{{ID: "bridge-abcdef", Name: "Work Bridge"}},
+				Endpoints: []config.Endpoint{{URL: "http://aperture.example.ts.net", BridgeID: "bridge-abcdef"}},
+			},
+		},
+		width:            50,
+		forcedToEndpoint: true,
+		preflightErr:     "bridge Work Bridge could not reach endpoint: lookup aperture.example.ts.net on 127.0.0.53:53: no such host",
+		bridgeLogs: []string{
+			`Bridge network: state=Running tailnet="example.com" dns_suffix="example.ts.net" peers=597`,
+		},
+	}
+	m.resetStack(m.setupGuideMenu())
+
+	for i, line := range strings.Split(m.View(), "\n") {
+		if width := ansi.StringWidth(line); width > m.width {
+			t.Errorf("line %d width = %d, want <= %d: %q", i, width, m.width, line)
+		}
+	}
 }
 
 func TestEndpointLabel_ShowsBridge(t *testing.T) {
@@ -375,5 +856,24 @@ func TestEndpointLabel_ShowsBridge(t *testing.T) {
 	got := m.endpointLabel(config.Endpoint{URL: "http://ai", BridgeID: "bridge-abcdef"})
 	if got != "http://ai via Work" {
 		t.Errorf("endpointLabel = %q", got)
+	}
+}
+
+func TestRootHeaderShowsLogicalBridgeEndpoint(t *testing.T) {
+	m := &model{
+		g: &config.Global{
+			ApertureHost: "http://127.0.0.1:41234",
+			Settings: config.Settings{
+				Bridges:   []config.Bridge{{ID: "bridge-abcdef", Name: "Work"}},
+				Endpoints: []config.Endpoint{{URL: "http://ai", BridgeID: "bridge-abcdef"}},
+			},
+		},
+		step:      stepMenu,
+		connected: true,
+	}
+	m.resetStack(m.rootMenu())
+	header := m.menuHeader(m.top())
+	if !strings.Contains(header, "http://ai via Work") || strings.Contains(header, "127.0.0.1") {
+		t.Fatalf("root header = %q", header)
 	}
 }

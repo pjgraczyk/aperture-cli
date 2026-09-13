@@ -123,7 +123,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("aperture", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	version := fs.Bool("version", false, "print version and exit")
-	debugMode := fs.Bool("debug", false, "print env vars set before launching agent")
+	debugMode := fs.Bool("debug", false, "enable bridge diagnostics and print agent launch environment")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: aperture [--debug] | aperture --version | aperture <models|doctor> [options]")
 		fs.PrintDefaults()

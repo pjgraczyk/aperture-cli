@@ -1,10 +1,16 @@
-// Package codex is the OpenAI Codex client. It supports both OpenAI platform
-// API-key providers through /v1/responses and ChatGPT subscription providers
-// through Aperture's /codex/responses OAuth passthrough route.
+// Package codex is the OpenAI Codex client. It speaks OpenAI's /v1/responses
+// API and is registered only with providers that advertise /v1/responses. It
+// points Codex at the Aperture gateway with per-launch configuration overrides
+// while preserving the user's normal Codex configuration and state. ChatGPT
+// subscription providers run through Aperture's /codex/responses OAuth
+// passthrough route instead of an API key.
 package codex
 
 import (
+	"fmt"
+	"os"
 	"os/exec"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -24,7 +30,6 @@ type Client struct{}
 const (
 	name       = "OpenAI Codex"
 	binaryName = "codex"
-	compatKey  = "openai_responses"
 )
 
 // Name implements clients.Client.
@@ -45,6 +50,19 @@ func (c *Client) IsInstalled() bool {
 
 // Install implements clients.Client.
 func (c *Client) Install(_ *config.Global) clients.InstallPlan {
+	return installPlan(runtime.GOOS)
+}
+
+func installPlan(goos string) clients.InstallPlan {
+	if goos == "linux" || goos == "darwin" {
+		const command = "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+		return clients.InstallPlan{
+			Hint: command,
+			Run: func() (*exec.Cmd, error) {
+				return exec.Command("/bin/sh", "-c", command), nil
+			},
+		}
+	}
 	return clients.InstallPlan{
 		Hint: "npm install -g @openai/codex",
 		Run: func() (*exec.Cmd, error) {
@@ -55,6 +73,18 @@ func (c *Client) Install(_ *config.Global) clients.InstallPlan {
 
 // Uninstall implements clients.Client.
 func (c *Client) Uninstall() clients.UninstallPlan {
+	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		if install, ok := findStandaloneInstall(); ok {
+			return clients.UninstallPlan{
+				Hint: "remove standalone Codex installation at " + install.binaryPath,
+				Run:  install.remove,
+			}
+		}
+	}
+	return npmUninstallPlan()
+}
+
+func npmUninstallPlan() clients.UninstallPlan {
 	return clients.UninstallPlan{
 		Hint: "npm uninstall -g @openai/codex",
 		Run: func() error {
@@ -122,28 +152,37 @@ func (c *Client) modelStep(g *config.Global, p config.ProviderInfo) menu.Result 
 	}}
 }
 
-// launch writes CODEX_HOME, builds the exec spec, records the launch state,
-// and returns a tea.Cmd.
+// launch builds the exec spec, records the launch state, and returns a tea.Cmd.
 func (c *Client) launch(g *config.Global, p config.ProviderInfo, model string) menu.Result {
 	bin := clients.FindBinary(binaryName, c.CommonPaths())
 	if bin == "" {
 		bin = binaryName
 	}
 	subscription := isChatGPTSubscription(p)
-	codexHome, err := writeConfig(g.ApertureHost, subscription)
-	if err != nil {
-		return errorResult("Failed to write Codex config: " + err.Error())
+	var args []string
+	var env map[string]string
+	var cleanup func() error
+	if subscription {
+		// ChatGPT subscription passthrough: Codex supplies its own OAuth
+		// token against Aperture's /codex route.
+		codexHome, err := writeConfig(g.ApertureHost, true)
+		if err != nil {
+			return errorResult("Failed to write Codex config: " + err.Error())
+		}
+		env = map[string]string{"CODEX_HOME": codexHome}
+		if model != "" {
+			env["OPENAI_MODEL"] = stripProviderPrefix(model)
+		}
+	} else {
+		modelCatalogPath, catalogCleanup, err := prepareModelCatalog(bin, g.Providers, p.ID)
+		if err != nil && g.Debug {
+			fmt.Fprintf(os.Stderr, "\r\n[debug] unable to prepare Codex model aliases: %v\r\n", err)
+		}
+		if catalogCleanup != nil {
+			cleanup = func() error { catalogCleanup(); return nil }
+		}
+		args, env = apertureLaunchConfig(g.ApertureHost, modelCatalogPath)
 	}
-	env := map[string]string{"CODEX_HOME": codexHome}
-	if !subscription {
-		env["OPENAI_BASE_URL"] = strings.TrimRight(g.ApertureHost, "/") + "/v1"
-		env["OPENAI_API_KEY"] = "not-needed"
-	}
-	if model != "" {
-		env["OPENAI_MODEL"] = stripProviderPrefix(model)
-	}
-
-	args := []string{}
 	if model != "" {
 		args = append(args, "--model", model)
 	}
@@ -159,10 +198,11 @@ func (c *Client) launch(g *config.Global, p config.ProviderInfo, model string) m
 	})
 
 	cmd := clients.Launch(clients.LaunchSpec{
-		Binary: bin,
-		Args:   args,
-		Env:    env,
-		Debug:  g.Debug,
+		Binary:  bin,
+		Args:    args,
+		Env:     env,
+		Cleanup: cleanup,
+		Debug:   g.Debug,
 	})
 	return menu.Result{Cmd: cmd, PopOnDone: true}
 }
@@ -179,7 +219,7 @@ func (c *Client) Replay(g *config.Global) tea.Cmd {
 	if !ok {
 		return nil
 	}
-	if !prov.Compatibility[compatKey] {
+	if !prov.SupportsEndpoint(config.EndpointOpenAIResponses) {
 		return nil
 	}
 	model := g.LastLaunch.LastModel
@@ -205,7 +245,7 @@ func (c *Client) QuickSelectLabel(g *config.Global) string {
 func compatibleProviders(all []config.ProviderInfo) []config.ProviderInfo {
 	var out []config.ProviderInfo
 	for _, p := range all {
-		if p.Compatibility[compatKey] {
+		if p.SupportsEndpoint(config.EndpointOpenAIResponses) {
 			out = append(out, p)
 		}
 	}

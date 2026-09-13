@@ -43,8 +43,9 @@ type Client interface {
 	Menu(g *config.Global) menu.MenuItem
 
 	// Replay attempts to re-launch the client using the last-used selection
-	// stored in g.LastLaunch. Returns nil if the state is stale (binary
-	// missing, provider gone from g.Providers, model no longer listed).
+	// stored in g.LastLaunch. The TUI only offers replay when the recorded
+	// endpoint is active. Returns nil if the state is stale (binary missing,
+	// provider gone from g.Providers, model no longer listed).
 	Replay(g *config.Global) tea.Cmd
 
 	// QuickSelectLabel is the display text for the [0] quick-select row
@@ -60,6 +61,10 @@ type InstallPlan struct {
 	// Run returns the command to execute on confirmation. If nil, the install
 	// is manual-only: the TUI shows Hint and does nothing.
 	Run func() (*exec.Cmd, error)
+	// SkipInstalledCheck is for commands that only begin a user-driven
+	// installation, such as opening a download page. Automated installers
+	// should leave this false so the TUI verifies the resulting binary.
+	SkipInstalledCheck bool
 }
 
 // UninstallPlan describes how to uninstall a client.

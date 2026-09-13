@@ -9,6 +9,31 @@ import (
 	"strings"
 )
 
+const (
+	apertureModelProvider = "tailscale_aperture_cli"
+	apertureAPIKeyEnv     = "APERTURE_CODEX_API_KEY"
+)
+
+// apertureLaunchConfig returns the CLI overrides and environment needed to
+// route Codex through Aperture. The CLI overrides take precedence over the
+// user's Codex configuration without replacing CODEX_HOME or rewriting any of
+// its files.
+func apertureLaunchConfig(apertureHost, modelCatalogPath string) ([]string, map[string]string) {
+	provider := "{ name = \"Aperture\", base_url = " + strconv.Quote(apertureHost+"/v1") +
+		", env_key = \"" + apertureAPIKeyEnv + "\", supports_websockets = false }"
+	args := []string{
+		"--config", "model_provider=" + strconv.Quote(apertureModelProvider),
+		"--config", "model_providers." + apertureModelProvider + "=" + provider,
+	}
+	if modelCatalogPath != "" {
+		args = append(args, "--config", "model_catalog_json="+strconv.Quote(modelCatalogPath))
+	}
+	env := map[string]string{
+		apertureAPIKeyEnv: "not-needed",
+	}
+	return args, env
+}
+
 // writeConfig creates (or refreshes) the persistent CODEX_HOME directory
 // holding auth.json and config.toml. Returns the directory path suitable
 // for the CODEX_HOME environment variable.
@@ -20,6 +45,10 @@ import (
 // The path is the legacy "<config>/aperture/codex-home" used before the
 // clients refactor, preserved so any per-home state Codex has stored under
 // it continues to resolve.
+//
+// writeConfig is only used for ChatGPT subscription passthrough providers,
+// where Codex must supply its own OAuth token against Aperture's /codex
+// route and a per-home CODEX_HOME is required.
 func writeConfig(apertureHost string, subscription bool) (string, error) {
 	cfgDir, err := os.UserConfigDir()
 	if err != nil {
