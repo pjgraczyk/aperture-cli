@@ -212,7 +212,7 @@ func (c *Client) launch(g *config.Global, p config.ProviderInfo, model string) m
 	if bin == "" {
 		bin = binaryName
 	}
-	configPath, cleanup, err := writeProviderConfig(g.ApertureHost, p, g.Settings.YoloMode)
+	configPath, cleanup, err := writeProviderConfig(g.ApertureHost, p, model, g.Settings.YoloMode)
 	if err != nil {
 		return errorResult("Failed to write OpenCode config: " + err.Error())
 	}
@@ -227,11 +227,11 @@ func (c *Client) launch(g *config.Global, p config.ProviderInfo, model string) m
 		env["AWS_REGION"] = "us-east-1"
 	}
 
-	args := argsForModel(model)
-
+	// The selected model is conveyed via the config file's top-level
+	// "model" default: opencode v2 has no top-level --model flag (it only
+	// exists on `run`), so launch bare opencode with no args.
 	spec := clients.LaunchSpec{
 		Binary:  bin,
-		Args:    args,
 		Env:     env,
 		Cleanup: cleanup,
 		Debug:   g.Debug,
@@ -291,13 +291,6 @@ func fqnModels(p config.ProviderInfo) []string {
 		out[i] = providerID + "/" + model
 	}
 	return out
-}
-
-func argsForModel(model string) []string {
-	if model == "" {
-		return nil
-	}
-	return []string{"--model", model}
 }
 
 func compatibleProviders(all []config.ProviderInfo) []config.ProviderInfo {

@@ -117,17 +117,6 @@ func TestModelStep(t *testing.T) {
 	}
 }
 
-func TestArgsForModel(t *testing.T) {
-	if got := argsForModel(""); got != nil {
-		t.Fatalf("argsForModel(empty) = %v, want nil", got)
-	}
-	model := "openrouter/anthropic/claude-sonnet"
-	got := argsForModel(model)
-	if len(got) != 2 || got[0] != "--model" || got[1] != model {
-		t.Fatalf("argsForModel(%q) = %v", model, got)
-	}
-}
-
 func TestModelOutputContainsExactModel(t *testing.T) {
 	output := []byte("openai/gpt-5.5-mini\nopenai/gpt-5.5\n")
 	if !modelOutputContains(output, "openai/gpt-5.5") {
@@ -413,7 +402,7 @@ func TestWriteProviderConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			configPath, cleanup, err := writeProviderConfig(testHost, tt.provider, tt.yolo)
+			configPath, cleanup, err := writeProviderConfig(testHost, tt.provider, "", tt.yolo)
 			if err != nil {
 				t.Fatalf("writeProviderConfig: %v", err)
 			}
@@ -423,6 +412,7 @@ func TestWriteProviderConfig(t *testing.T) {
 				t.Fatalf("config file not readable: %v", err)
 			}
 			var cfg struct {
+				Model      string              `json:"model"`
 				Permission map[string]string `json:"permission"`
 				Provider   map[string]struct {
 					NPM       string                       `json:"npm"`
@@ -437,6 +427,9 @@ func TestWriteProviderConfig(t *testing.T) {
 			}
 			if len(cfg.Permission) != len(tt.wantPermission) {
 				t.Errorf("permission = %+v, want %+v", cfg.Permission, tt.wantPermission)
+			}
+			if cfg.Model != "" {
+				t.Errorf("model = %q, want empty when no model selected", cfg.Model)
 			}
 			for key, want := range tt.wantPermission {
 				if got := cfg.Permission[key]; got != want {
@@ -495,6 +488,29 @@ func TestWriteProviderConfig(t *testing.T) {
 	}
 }
 
+func TestWriteProviderConfigSetsDefaultModel(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	p := config.ProviderInfo{ID: "openrouter", Models: []string{"gpt-5"}, SupportedEndpoints: map[string]bool{config.EndpointOpenAIChat: true}}
+	configPath, cleanup, err := writeProviderConfig(testHost, p, "openrouter/gpt-5", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Model != "openrouter/gpt-5" {
+		t.Fatalf("model = %q, want %q", cfg.Model, "openrouter/gpt-5")
+	}
+}
+
 func TestCleanupStaleConfigs(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
@@ -525,12 +541,12 @@ func TestCleanupStaleConfigs(t *testing.T) {
 func TestWriteProviderConfigUsesUniquePrivateFiles(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	p := config.ProviderInfo{ID: "openrouter", Models: []string{"gpt-5"}, SupportedEndpoints: map[string]bool{config.EndpointOpenAIChat: true}}
-	first, cleanFirst, err := writeProviderConfig(testHost, p, false)
+	first, cleanFirst, err := writeProviderConfig(testHost, p, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cleanFirst()
-	second, cleanSecond, err := writeProviderConfig(testHost, p, false)
+	second, cleanSecond, err := writeProviderConfig(testHost, p, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

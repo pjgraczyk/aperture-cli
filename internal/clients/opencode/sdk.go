@@ -13,6 +13,7 @@ import (
 
 type opencodeConfig struct {
 	Schema     string                      `json:"$schema,omitempty"`
+	Model      string                      `json:"model,omitempty"`
 	Provider   map[string]opencodeProvider `json:"provider,omitempty"`
 	Permission map[string]string           `json:"permission,omitempty"`
 }
@@ -83,7 +84,7 @@ func pickSDK(p config.ProviderInfo, apertureHost string) (npm string, options ma
 // the path plus an idempotent cleanup
 // function that removes the file. The config defines one provider (the
 // chosen one) mapped to the SDK picked from its advertised endpoints.
-func writeProviderConfig(apertureHost string, p config.ProviderInfo, yolo bool) (string, func() error, error) {
+func writeProviderConfig(apertureHost string, p config.ProviderInfo, model string, yolo bool) (string, func() error, error) {
 	npm, options := pickSDK(p, apertureHost)
 	providerID := providerConfigID(p)
 
@@ -99,6 +100,7 @@ func writeProviderConfig(apertureHost string, p config.ProviderInfo, yolo bool) 
 
 	cfg := opencodeConfig{
 		Schema: "https://opencode.ai/config.json",
+		Model:  model,
 		Provider: map[string]opencodeProvider{
 			providerID: {
 				NPM:       npm,
