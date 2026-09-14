@@ -48,6 +48,16 @@ func TestProviderAuthStep(t *testing.T) {
 	t.Setenv("HOME", tmp)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(tmp, "data"))
+	// providerAuthStep requires npx to offer the plugin install menu.
+	// Stub it so the test is hermetic on machines without Node.js.
+	binDir := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "npx"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	provider := config.ProviderInfo{
 		ID:                 "openai-sub",
 		Name:               "OpenAI (Subscription)",
