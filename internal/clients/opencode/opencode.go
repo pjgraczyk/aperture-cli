@@ -200,6 +200,14 @@ func (c *Client) modelStep(g *config.Global, p config.ProviderInfo) menu.Result 
 }
 
 func (c *Client) launch(g *config.Global, p config.ProviderInfo, model string) menu.Result {
+	// Validate locally against the provider's advertised models. The temp
+	// config written below exposes exactly fqnModels(p), so anything else
+	// can never resolve. (opencode v2 removed the `models <provider>`
+	// filter, and its background server may serve a stale config, so a CLI
+	// round-trip cannot reliably validate.)
+	if model != "" && !slices.Contains(fqnModels(p), model) {
+		return errorResult(fmt.Sprintf("model %q is not available for provider %q", model, p.DisplayName()))
+	}
 	bin := clients.FindBinary(binaryName, c.CommonPaths())
 	if bin == "" {
 		bin = binaryName
@@ -342,8 +350,13 @@ func refreshSetupResult(result menu.Result) menu.Result {
 
 var resolveModels = defaultResolveModels
 
-func defaultResolveModels(ctx context.Context, binary string, env map[string]string, provider, selected string) error {
-	cmd := exec.CommandContext(ctx, binary, "models", provider)
+func defaultResolveModels(ctx context.Context, binary string, env map[string]string, _, _ string) error {
+	// Best-effort connectivity check only. opencode v2 removed the optional
+	// `models <provider>` positional filter, and the background server may
+	// serve a stale config that does not include our just-written temp
+	// provider, so model membership must NOT be checked here (launch()
+	// already validates locally). Only a failing CLI itself is an error.
+	cmd := exec.CommandContext(ctx, binary, "models")
 	cmd.Env = os.Environ()
 	for key, value := range env {
 		cmd.Env = append(cmd.Env, key+"="+value)
@@ -354,9 +367,6 @@ func defaultResolveModels(ctx context.Context, binary string, env map[string]str
 	}
 	if err != nil {
 		return fmt.Errorf("model check failed: %s", boundedDiagnostic(output))
-	}
-	if selected != "" && !modelOutputContains(output, selected) {
-		return fmt.Errorf("model %q is not available (OpenCode returned: %s)", selected, boundedDiagnostic(output))
 	}
 	return nil
 }

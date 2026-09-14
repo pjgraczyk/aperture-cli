@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,6 +135,63 @@ func TestModelOutputContainsExactModel(t *testing.T) {
 	}
 	if modelOutputContains(output, "openai/gpt-5") {
 		t.Fatal("partial model match was accepted")
+	}
+}
+
+func TestDefaultResolveModelsUsesNoPositionalArg(t *testing.T) {
+	// opencode v2 rejects `models <provider>`; the preflight must not pass
+	// a positional arg.
+	dir := t.TempDir()
+	fakeBin := filepath.Join(dir, "opencode")
+	argsFile := filepath.Join(dir, "args")
+	script := "#!/bin/sh\necho \"$*\" > \"$OPENCODE_TEST_ARGS\"\n"
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPENCODE_TEST_ARGS", argsFile)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := defaultResolveModels(ctx, fakeBin, nil, "some-provider", "some-provider/some-model"); err != nil {
+		t.Fatalf("defaultResolveModels: %v", err)
+	}
+	raw, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.TrimSpace(string(raw)), "models"; got != want {
+		t.Fatalf("invoked args = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultResolveModelsPropagatesCLIFailure(t *testing.T) {
+	dir := t.TempDir()
+	fakeBin := filepath.Join(dir, "opencode")
+	if err := os.WriteFile(fakeBin, []byte("#!/bin/sh\necho boom >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := defaultResolveModels(ctx, fakeBin, nil, "p", "p/m")
+	if err == nil || !strings.Contains(err.Error(), "model check failed") {
+		t.Fatalf("err = %v, want model check failure", err)
+	}
+}
+
+func TestLaunchRejectsUnknownModelLocally(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	g := &config.Global{ApertureHost: testHost}
+	p := config.ProviderInfo{ID: "openrouter", Models: []string{"gpt-5"}, SupportedEndpoints: map[string]bool{config.EndpointOpenAIChat: true}}
+	msg := (&Client{}).launch(g, p, "openrouter/nope").Cmd()
+	done, ok := msg.(menu.SimpleDoneMsg)
+	if !ok || done.Err == nil || !strings.Contains(done.Err.Error(), "not available") {
+		t.Fatalf("launch result = %#v, want local not-available error", msg)
+	}
+	if g.LastLaunch.LastClientName != "" {
+		t.Fatalf("rejected model recorded state: %+v", g.LastLaunch)
+	}
+	files, err := filepath.Glob(filepath.Join(os.Getenv("HOME"), ".opencode", "aperture-*.json"))
+	if err != nil || len(files) != 0 {
+		t.Fatalf("temporary configs after rejection = %v, err=%v", files, err)
 	}
 }
 
