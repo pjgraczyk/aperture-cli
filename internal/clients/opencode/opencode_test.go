@@ -127,9 +127,10 @@ func TestModelOutputContainsExactModel(t *testing.T) {
 	}
 }
 
-func TestDefaultResolveModelsUsesNoPositionalArg(t *testing.T) {
-	// opencode v2 rejects `models <provider>`; the preflight must not pass
-	// a positional arg.
+func TestDefaultResolveModelsStandaloneNoProviderArg(t *testing.T) {
+	// opencode v2 rejects `models <provider>` and the background server
+	// ignores our temp config; the preflight must run
+	// `models --standalone` with no positional arg.
 	dir := t.TempDir()
 	fakeBin := filepath.Join(dir, "opencode")
 	argsFile := filepath.Join(dir, "args")
@@ -147,8 +148,16 @@ func TestDefaultResolveModelsUsesNoPositionalArg(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := strings.TrimSpace(string(raw)), "models"; got != want {
+	if got, want := strings.TrimSpace(string(raw)), "models --standalone"; got != want {
 		t.Fatalf("invoked args = %q, want %q", got, want)
+	}
+}
+
+func TestTuiArgsUsesStandalone(t *testing.T) {
+	// The TUI must run against a private server honoring the launch's
+	// OPENCODE_CONFIG; the shared background server serves a stale config.
+	if got := tuiArgs(); !slices.Equal(got, []string{"--standalone"}) {
+		t.Fatalf("tuiArgs = %q, want [--standalone]", got)
 	}
 }
 

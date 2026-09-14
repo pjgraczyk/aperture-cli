@@ -229,9 +229,13 @@ func (c *Client) launch(g *config.Global, p config.ProviderInfo, model string) m
 
 	// The selected model is conveyed via the config file's top-level
 	// "model" default: opencode v2 has no top-level --model flag (it only
-	// exists on `run`), so launch bare opencode with no args.
+	// exists on `run`), so launch bare opencode with no model flag.
+	// --standalone pins the TUI to a private server honoring this launch's
+	// OPENCODE_CONFIG; the shared background server would otherwise serve
+	// a stale config without our temp provider.
 	spec := clients.LaunchSpec{
 		Binary:  bin,
+		Args:    tuiArgs(),
 		Env:     env,
 		Cleanup: cleanup,
 		Debug:   g.Debug,
@@ -293,6 +297,11 @@ func fqnModels(p config.ProviderInfo) []string {
 	return out
 }
 
+// tuiArgs are the CLI args for an interactive OpenCode launch.
+func tuiArgs() []string {
+	return []string{"--standalone"}
+}
+
 func compatibleProviders(all []config.ProviderInfo) []config.ProviderInfo {
 	var out []config.ProviderInfo
 	for _, p := range all {
@@ -344,12 +353,13 @@ func refreshSetupResult(result menu.Result) menu.Result {
 var resolveModels = defaultResolveModels
 
 func defaultResolveModels(ctx context.Context, binary string, env map[string]string, _, _ string) error {
-	// Best-effort connectivity check only. opencode v2 removed the optional
-	// `models <provider>` positional filter, and the background server may
-	// serve a stale config that does not include our just-written temp
-	// provider, so model membership must NOT be checked here (launch()
-	// already validates locally). Only a failing CLI itself is an error.
-	cmd := exec.CommandContext(ctx, binary, "models")
+	// Best-effort connectivity check only, in the same --standalone mode
+	// the TUI will use. opencode v2 removed the optional `models
+	// <provider>` positional filter, and the background server serves a
+	// stale config without our just-written temp provider, so model
+	// membership must NOT be checked here (launch() already validates
+	// locally). Only a failing CLI itself is an error.
+	cmd := exec.CommandContext(ctx, binary, "models", "--standalone")
 	cmd.Env = os.Environ()
 	for key, value := range env {
 		cmd.Env = append(cmd.Env, key+"="+value)
