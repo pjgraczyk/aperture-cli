@@ -412,7 +412,7 @@ func TestWriteProviderConfig(t *testing.T) {
 				t.Fatalf("config file not readable: %v", err)
 			}
 			var cfg struct {
-				Model      string              `json:"model"`
+				Model      string            `json:"model"`
 				Permission map[string]string `json:"permission"`
 				Provider   map[string]struct {
 					NPM       string                       `json:"npm"`
